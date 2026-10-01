@@ -13,6 +13,7 @@ from charts import (
     build_circadian_heatmap,
     build_circadian_profile,
     build_explorer_plot,
+    build_group_coverage_heatmap,
     build_sleep_timing,
     build_timeline,
 )
@@ -30,6 +31,16 @@ from data import (
     missing_dates,
     resolve_resolution,
     subtype_index,
+)
+from group_coverage import (
+    build_and_cache_coverages,
+    coverage_cache_directory,
+    discover_variables,
+    load_cached_coverage,
+    load_variable_catalogue,
+    prepare_coverage_view,
+    save_variable_catalogue,
+    variable_from_record,
 )
 
 
@@ -228,7 +239,7 @@ def timeline_tab(
         survey_selected = columns[0].multiselect(
             "Survey scores",
             tuple(SURVEY_METRICS),
-            default=("Stress score", "Positive affect","Negative affect"),
+            default=("Stress score", "Positive affect","Negative affect","Anxiety score"),
         )
         activity_selected = columns[1].multiselect(
             "Activity",
@@ -313,7 +324,8 @@ def timeline_tab(
 
     st.caption(
         f"Effective resolution: **{resolution}**. Native values bypass binning; "
-        "survey observations and nightly sleep-stage summaries are always discrete."
+        "survey observations and nightly sleep-stage summaries are always discrete. "
+        "Light grey shading marks weekends (Saturday–Sunday)."
     )
     figure = build_timeline(plotted, sleep, start, end)
     st.plotly_chart(
@@ -499,6 +511,432 @@ def coverage_tab(participant_path: str) -> None:
         st.dataframe(problems, width="stretch", hide_index=True)
 
 
+def group_coverage_view(
+    parquet_root: str,
+    participant_paths: tuple[str, ...],
+) -> None:
+    """Render population-level coverage without loading participant views."""
+
+    st.title("Tesserae group coverage")
+    st.caption(
+        "Daily coverage means at least one non-null value for the selected "
+        "category, subtype, and column. Raw physiological values are not "
+        "stored in the coverage cache."
+    )
+    cache_directory = coverage_cache_directory(parquet_root)
+    catalogue = load_variable_catalogue(parquet_root)
+    with st.expander(
+        "Variable catalogue and cache",
+        expanded=catalogue.empty,
+    ):
+        st.caption(f"Persistent cache: `{cache_directory}`")
+        catalogue_controls = st.columns((1.2, 3), vertical_alignment="center")
+        catalogue_action = catalogue_controls[0].button(
+            "Discover variables" if catalogue.empty else "Refresh catalogue",
+            type="primary" if catalogue.empty else "secondary",
+            use_container_width=True,
+        )
+        catalogue_controls[1].caption(
+            "The saved catalogue is reused after dashboard restarts. Refresh only "
+            "when source schemas change. Discovery samples one Parquet schema per "
+            "participant/source and unions the columns found across participants."
+        )
+
+    if catalogue_action:
+        progress_bar = st.progress(0.0, text="Starting variable discovery…")
+
+        def discovery_progress(done: int, total: int, label: str) -> None:
+            progress_bar.progress(
+                done / total if total else 1.0,
+                text=f"Discovering variables · participant {done:,} of {total:,}",
+            )
+
+        catalogue, discovery_errors = discover_variables(
+            parquet_root,
+            participant_paths,
+            progress=discovery_progress,
+        )
+        save_variable_catalogue(catalogue, parquet_root)
+        progress_bar.empty()
+        if discovery_errors.empty:
+            st.success(f"Discovered {len(catalogue):,} physical columns.")
+        else:
+            st.warning(
+                f"Discovered {len(catalogue):,} columns with "
+                f"{len(discovery_errors):,} unreadable representative files."
+            )
+            with st.expander("Variable-discovery errors"):
+                st.dataframe(discovery_errors, width="stretch", hide_index=True)
+
+    if catalogue.empty:
+        st.info("Discover variables before building group coverage.")
+        return
+
+    supported = catalogue.loc[catalogue["timestamp_column"].notna()].copy()
+    unsupported = catalogue.loc[catalogue["timestamp_column"].isna()].copy()
+    if not unsupported.empty:
+        with st.expander(
+            f"Columns without a usable date ({len(unsupported):,})",
+            expanded=False,
+        ):
+            st.caption(
+                "These columns are discoverable but cannot be plotted as daily "
+                "coverage because their source has no recognised timestamp."
+            )
+            st.dataframe(
+                unsupported[["category", "subtype", "column", "arrow_type"]],
+                width="stretch",
+                hide_index=True,
+            )
+    if supported.empty:
+        st.warning(
+            "No discovered columns belong to a source with a recognised timestamp."
+        )
+        return
+
+    labels = {
+        row.variable_id: f"{row.category} / {row.subtype} / {row.column}"
+        for row in supported.itertuples()
+    }
+    available_ids = set(supported["variable_id"])
+    selection_key = "group_coverage_selected_variables"
+    selection_root_key = "group_coverage_selection_root"
+    resolved_root = str(Path(parquet_root).expanduser().resolve())
+    if st.session_state.get(selection_root_key) != resolved_root:
+        st.session_state[selection_root_key] = resolved_root
+        st.session_state[selection_key] = []
+    selected_ids = [
+        identifier
+        for identifier in st.session_state.get(selection_key, [])
+        if identifier in available_ids
+    ]
+    st.session_state[selection_key] = selected_ids
+
+    with st.container(border=True):
+        st.markdown("#### Select variables")
+        st.caption(
+            "Choose a physical column and add it to the comparison. Change the "
+            "category or subtype to combine variables from different sources."
+        )
+        selector_columns = st.columns(
+            (1, 1, 1.5, 0.55),
+            vertical_alignment="bottom",
+        )
+        categories = sorted(supported["category"].dropna().unique())
+        selected_category = selector_columns[0].selectbox(
+            "Category",
+            categories,
+            key="group_coverage_category",
+        )
+        category_rows = supported.loc[supported["category"] == selected_category]
+        subtypes = sorted(category_rows["subtype"].dropna().unique())
+        selected_subtype = selector_columns[1].selectbox(
+            "Subtype",
+            subtypes,
+            key="group_coverage_subtype",
+        )
+        schema_rows = category_rows.loc[category_rows["subtype"] == selected_subtype]
+        schema_lookup = schema_rows.set_index("variable_id")
+        candidate_id = selector_columns[2].selectbox(
+            "Schema column",
+            schema_rows["variable_id"].tolist(),
+            format_func=lambda identifier: (
+                f"{schema_lookup.loc[identifier, 'column']} "
+                f"({schema_lookup.loc[identifier, 'arrow_type']})"
+            ),
+            key="group_coverage_schema_column",
+        )
+        already_selected = candidate_id in selected_ids
+        add_requested = selector_columns[3].button(
+            "Added" if already_selected else "Add",
+            type="primary" if not already_selected else "secondary",
+            disabled=already_selected,
+            use_container_width=True,
+        )
+        if add_requested:
+            st.session_state[selection_key] = [*selected_ids, candidate_id]
+            st.rerun()
+
+        if selected_ids:
+            st.markdown(f"**Selected variables ({len(selected_ids)})**")
+            selected_lookup = supported.set_index("variable_id")
+            for index, identifier in enumerate(selected_ids):
+                record = selected_lookup.loc[identifier]
+                variable_columns = st.columns(
+                    (5, 0.8),
+                    vertical_alignment="center",
+                )
+                variable_columns[0].markdown(
+                    f"**{record['column']}** &nbsp; "
+                    f"{record['category']} / {record['subtype']} &nbsp; "
+                    f"`{record['arrow_type']}`"
+                )
+                if variable_columns[1].button(
+                    "Remove",
+                    key=f"group_coverage_remove_{index}",
+                    use_container_width=True,
+                ):
+                    st.session_state[selection_key] = [
+                        item for item in selected_ids if item != identifier
+                    ]
+                    st.rerun()
+
+    if not selected_ids:
+        st.info(
+            "Choose a category, subtype, and schema column, then click Add. "
+            "Repeat to compare variables from different sources."
+        )
+        return
+
+    selected_records = supported.loc[
+        supported["variable_id"].isin(selected_ids)
+    ].set_index("variable_id").loc[selected_ids].reset_index()
+    variables = [variable_from_record(row) for _, row in selected_records.iterrows()]
+
+    cached: dict[str, tuple[pd.DataFrame, dict | None, pd.DataFrame]] = {
+        variable.variable_id: load_cached_coverage(parquet_root, variable)
+        for variable in variables
+    }
+    missing_variables = [
+        variable
+        for variable in variables
+        if cached[variable.variable_id][1] is None
+    ]
+
+    building_state_key = "group_coverage_building"
+    was_building = bool(st.session_state.get(building_state_key, False))
+    with st.container(border=True):
+        st.markdown("#### Daily coverage cache")
+        build_controls = st.columns(
+            (1.3, 1.4, 1.0, 2.5),
+            vertical_alignment="center",
+        )
+        build_requested = build_controls[0].button(
+            "Build missing coverage",
+            type="primary",
+            use_container_width=True,
+        )
+        refresh_requested = build_controls[1].button(
+            "Rebuild selected coverage",
+            use_container_width=True,
+        )
+        requested_targets = (
+            variables
+            if refresh_requested
+            else missing_variables
+            if build_requested
+            else []
+        )
+        stop_requested = build_controls[2].button(
+            "Stop building",
+            disabled=not (was_building or requested_targets),
+            use_container_width=True,
+        )
+        if missing_variables:
+            build_controls[3].caption(
+                f"{len(missing_variables):,} of {len(variables):,} selected "
+                "variable(s) still need a daily summary."
+            )
+        else:
+            build_controls[3].caption(
+                "All selected daily summaries are ready. Rebuild only when the "
+                "source data have changed."
+            )
+
+    targets = requested_targets
+    if stop_requested:
+        st.session_state[building_state_key] = False
+        targets = []
+        st.warning(
+            "Coverage building stopped. Previously completed cache files were kept; "
+            "the unfinished summary was not saved."
+        )
+    elif was_building and not targets:
+        st.session_state[building_state_key] = False
+        st.warning(
+            "The previous coverage build was interrupted by a dashboard update. "
+            "Previously completed cache files were kept."
+        )
+    if build_requested and not targets:
+        st.success("All selected coverage summaries are already cached.")
+    if targets:
+        st.session_state[building_state_key] = True
+        progress_bar = st.progress(0.0, text="Preparing daily coverage…")
+
+        def build_progress(done: int, total: int, label: str) -> None:
+            progress_bar.progress(
+                done / total if total else 1.0,
+                text=f"Building daily coverage · participant {done:,} of {total:,}",
+            )
+
+        try:
+            build_and_cache_coverages(
+                parquet_root,
+                targets,
+                participant_paths,
+                progress=build_progress,
+            )
+        except Exception:
+            st.session_state[building_state_key] = False
+            raise
+        st.session_state[building_state_key] = False
+        progress_bar.empty()
+        cached = {
+            variable.variable_id: load_cached_coverage(parquet_root, variable)
+            for variable in variables
+        }
+        st.success(f"Built {len(targets):,} coverage summary file(s).")
+
+    status_records = []
+    coverage_frames = []
+    error_frames = []
+    unavailable = []
+    for variable in variables:
+        coverage, manifest, errors = cached[variable.variable_id]
+        if manifest is None:
+            unavailable.append(variable.label)
+            status_records.append(
+                {
+                    "variable": variable.label,
+                    "status": "Not built",
+                    "built_at": None,
+                    "files_processed": 0,
+                    "participants_with_data": 0,
+                    "participant_days": 0,
+                    "errors": 0,
+                }
+            )
+            continue
+        coverage_frames.append(coverage)
+        if not errors.empty:
+            error_frames.append(errors.assign(variable=variable.label))
+        status_records.append(
+            {
+                "variable": variable.label,
+                "status": "Cached",
+                "built_at": manifest.get("built_at"),
+                "files_processed": manifest.get("files_processed", 0),
+                "participants_with_data": manifest.get("participants_with_data", 0),
+                "participant_days": manifest.get("participant_days", 0),
+                "errors": manifest.get("errors", 0),
+            }
+        )
+
+    with st.expander("Coverage cache status", expanded=bool(unavailable)):
+        st.dataframe(
+            pd.DataFrame.from_records(status_records),
+            width="stretch",
+            hide_index=True,
+        )
+    if unavailable:
+        st.info("Build every selected variable before plotting their overlap.")
+        return
+
+    coverage = (
+        pd.concat(coverage_frames, ignore_index=True)
+        if coverage_frames
+        else pd.DataFrame(columns=["participant_id", "date", "variable_id"])
+    )
+    participant_ids = tuple(Path(path).name for path in participant_paths)
+
+    controls = st.columns((1, 1.3, 1.2))
+    alignment_label = controls[0].radio(
+        "Alignment",
+        ("Participant Day 0", "Calendar date"),
+        horizontal=True,
+    )
+    display_options = ["Overlap count", *selected_ids]
+    display_choice = controls[1].selectbox(
+        "Colour by",
+        display_options,
+        format_func=lambda value: (
+            value if value == "Overlap count" else labels.get(value, value)
+        ),
+    )
+    participant_sort = controls[2].selectbox(
+        "Participant order",
+        ("Study span", "Study start", "Completeness", "Participant ID"),
+    )
+    alignment = "relative" if alignment_label == "Participant Day 0" else "calendar"
+    display_variable_id = None if display_choice == "Overlap count" else display_choice
+
+    start = end = None
+    valid_dates = pd.to_datetime(coverage["date"], errors="coerce").dropna()
+    if alignment == "calendar" and not valid_dates.empty:
+        minimum_date = valid_dates.min().date()
+        maximum_date = valid_dates.max().date()
+        selected_range = st.date_input(
+            "Calendar window",
+            value=(minimum_date, maximum_date),
+            min_value=minimum_date,
+            max_value=maximum_date,
+        )
+        if isinstance(selected_range, tuple) and len(selected_range) == 2:
+            start = pd.Timestamp(selected_range[0])
+            end = pd.Timestamp(selected_range[1])
+
+    view = prepare_coverage_view(
+        coverage,
+        participant_ids,
+        variables,
+        alignment=alignment,
+        display_variable_id=display_variable_id,
+        participant_sort=participant_sort,
+        start=start,
+        end=end,
+    )
+    selected_variable_label = (
+        labels.get(display_variable_id) if display_variable_id is not None else None
+    )
+    st.plotly_chart(
+        build_group_coverage_heatmap(
+            view.matrix,
+            view.hover_text,
+            maximum_value=view.maximum_value,
+            alignment=view.alignment,
+            selected_variable_label=selected_variable_label,
+        ),
+        use_container_width=True,
+        config={"scrollZoom": True, "displaylogo": False},
+    )
+
+    anchored = int((view.participant_summary["span_days"] > 0).sum())
+    complete_days = int(view.participant_summary["all_variables_days"].sum())
+    missing_days = int(view.participant_summary["internal_missing_days"].sum())
+    metrics = st.columns(4)
+    metrics[0].metric("Participants", f"{len(participant_ids):,}")
+    metrics[1].metric("With selected data", f"{anchored:,}")
+    metrics[2].metric("Complete-overlap days", f"{complete_days:,}")
+    metrics[3].metric("Internally missing days", f"{missing_days:,}")
+
+    participant_tab, variable_tab, combination_tab = st.tabs(
+        ("Participants", "Variables", "Coverage combinations")
+    )
+    with participant_tab:
+        st.dataframe(view.participant_summary, width="stretch", hide_index=True)
+        st.download_button(
+            "Download participant coverage CSV",
+            view.participant_summary.to_csv(index=False),
+            file_name="tesserae_participant_coverage.csv",
+            mime="text/csv",
+        )
+    with variable_tab:
+        st.dataframe(view.variable_summary, width="stretch", hide_index=True)
+        st.download_button(
+            "Download variable coverage CSV",
+            view.variable_summary.to_csv(index=False),
+            file_name="tesserae_variable_coverage.csv",
+            mime="text/csv",
+        )
+    with combination_tab:
+        st.dataframe(view.combination_summary, width="stretch", hide_index=True)
+
+    if error_frames:
+        errors = pd.concat(error_frames, ignore_index=True)
+        with st.expander(f"Coverage build errors ({len(errors):,})"):
+            st.dataframe(errors, width="stretch", hide_index=True)
+
+
 def main() -> None:
     st.sidebar.header("Data source")
     if st.sidebar.button("Refresh metadata cache"):
@@ -512,6 +950,16 @@ def main() -> None:
     except DataPathError as error:
         st.error(str(error))
         st.stop()
+    analysis_level = st.sidebar.radio(
+        "Analysis level",
+        ("Participant", "Group"),
+        horizontal=True,
+    )
+    st.sidebar.caption(f"{len(participant_paths):,} participant folders available")
+    if analysis_level == "Group":
+        group_coverage_view(parquet_root, participant_paths)
+        return
+
     preferred_index = next(
         (
             index
@@ -526,7 +974,6 @@ def main() -> None:
         index=preferred_index,
         format_func=lambda path: Path(path).name,
     )
-    st.sidebar.caption(f"{len(participant_paths):,} participant folders available")
     try:
         with st.spinner("Indexing Parquet metadata…"):
             index = cached_index(participant_path)
@@ -545,7 +992,7 @@ def main() -> None:
     app_header(participant_path, index)
     view = st.radio(
         "Dashboard view",
-        ("Timeline", "Circadian", "Data Explorer", "Coverage"),
+        ("Timeline", "Circadian", "Data Explorer", "Coverage", "EDM"),
         horizontal=True,
         label_visibility="collapsed",
     )
@@ -555,6 +1002,9 @@ def main() -> None:
         circadian_tab(participant_path, start, end)
     elif view == "Data Explorer":
         explorer_tab(participant_path, index, start, end)
+    elif view == "EDM":
+        from edm_ui import edm_tab
+        edm_tab(participant_path, index, start, end, load_view)
     else:
         coverage_tab(participant_path)
 

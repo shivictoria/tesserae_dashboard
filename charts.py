@@ -156,10 +156,36 @@ def build_timeline(
             )
         figure.update_yaxes(title_text="Hours", rangemode="tozero", row=sleep_row, col=1)
 
+    # Shade Saturday midnight through Monday midnight on every timeline track.
+    # Batch shapes to avoid repeatedly validating all previously added rectangles.
+    weekend_shapes = []
+    weekend_start = start.normalize() - pd.DateOffset(days=(start.weekday() - 5) % 7)
+    while weekend_start < end:
+        weekend_end = weekend_start + pd.DateOffset(days=2)
+        if weekend_end > start:
+            for row in range(1, row_count + 1):
+                suffix = str(row) if row > 1 else ""
+                weekend_shapes.append(
+                    dict(
+                        type="rect",
+                        x0=max(start, weekend_start),
+                        x1=min(end, weekend_end),
+                        xref=f"x{suffix}",
+                        yref=f"y{suffix} domain",
+                        y0=0,
+                        y1=1,
+                        fillcolor="rgba(128,128,128,0.12)",
+                        line_width=0,
+                        layer="below",
+                    )
+                )
+        weekend_start += pd.DateOffset(days=7)
+
     figure.update_xaxes(range=[start, end], showspikes=True, spikemode="across")
     figure.update_xaxes(rangeslider={"visible": True}, row=row_count, col=1) ## later should use cycle for this
 
     figure.update_layout(
+        shapes=weekend_shapes,
         template="plotly_white",
         barmode="stack",
         height=max(460, 185 * row_count),
@@ -403,6 +429,115 @@ def build_explorer_plot(frame: pd.DataFrame, metrics: list[str]) -> go.Figure:
         xaxis={"title": "Recorded local time", "rangeslider": {"visible": True}},
         yaxis={"title": "Value"},
         margin={"l": 70, "r": 25, "t": 25, "b": 50},
+    )
+    return figure
+
+
+def _group_coverage_colors(maximum_value: int) -> tuple[list[list[float | str]], list[str]]:
+    """Return a discrete outside/missing/partial/complete colour scale."""
+
+    maximum_value = max(int(maximum_value), 1)
+    colours = ["#D9DEE7", "#F6C7C7"]
+    for value in range(1, maximum_value + 1):
+        if value == maximum_value:
+            colours.append("#55A868")
+        else:
+            fraction = value / maximum_value
+            lightness = 88 - int(35 * fraction)
+            colours.append(f"hsl(211, 65%, {lightness}%)")
+
+    scale: list[list[float | str]] = []
+    count = len(colours)
+    for index, colour in enumerate(colours):
+        scale.extend(
+            [
+                [index / count, colour],
+                [(index + 1) / count, colour],
+            ]
+        )
+    return scale, colours
+
+
+def build_group_coverage_heatmap(
+    matrix: pd.DataFrame,
+    hover_text: np.ndarray,
+    *,
+    maximum_value: int,
+    alignment: str,
+    selected_variable_label: str | None = None,
+) -> go.Figure:
+    """Build a participant-by-day population coverage heatmap."""
+
+    if matrix.empty or matrix.shape[1] == 0:
+        return empty_figure("No selected-variable coverage is available to plot.")
+    if hover_text.shape != matrix.shape:
+        raise ValueError("hover_text must have the same shape as matrix")
+
+    maximum_value = max(int(maximum_value), 1)
+    colorscale, _ = _group_coverage_colors(maximum_value)
+    tick_values = [-1, *range(maximum_value + 1)]
+    if selected_variable_label is None:
+        tick_labels = [
+            "Outside span",
+            "Missing all",
+            *[
+                "Complete overlap" if value == maximum_value else f"{value} present"
+                for value in range(1, maximum_value + 1)
+            ],
+        ]
+        colourbar_title = "Signals present"
+    else:
+        tick_labels = ["Outside span", "Missing", "Present"]
+        colourbar_title = selected_variable_label
+
+    participant_positions = np.arange(len(matrix.index))
+    figure = go.Figure(
+        go.Heatmap(
+            z=matrix.to_numpy(dtype=float),
+            x=matrix.columns,
+            y=participant_positions,
+            customdata=hover_text,
+            zmin=-1.5,
+            zmax=maximum_value + 0.5,
+            colorscale=colorscale,
+            showscale=True,
+            colorbar={
+                "title": colourbar_title,
+                "tickmode": "array",
+                "tickvals": tick_values,
+                "ticktext": tick_labels,
+            },
+            hovertemplate="%{customdata}<extra></extra>",
+            hoverongaps=False,
+            xgap=0,
+            ygap=0,
+            zsmooth=False,
+        )
+    )
+    figure.update_xaxes(
+        title=("Days since first selected-variable observation" if alignment == "relative" else "Calendar date"),
+        showspikes=True,
+        spikemode="across",
+        spikesnap="cursor",
+        spikedash="dot",
+        spikecolor="#667085",
+    )
+    figure.update_yaxes(
+        title="Participant",
+        autorange="reversed",
+        showticklabels=False,
+        showspikes=True,
+        spikemode="across",
+        spikesnap="cursor",
+        spikecolor="#667085",
+    )
+    figure.update_layout(
+        title="Population data coverage",
+        template="plotly_white",
+        hovermode="closest",
+        height=max(500, min(1600, 220 + int(len(matrix) * 1.8))),
+        margin={"l": 70, "r": 40, "t": 55, "b": 55},
+        uirevision="group-coverage",
     )
     return figure
 
